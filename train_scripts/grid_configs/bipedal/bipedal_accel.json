@@ -57,7 +57,7 @@
 	  "test_interval": [100],
 	  "test_num_episodes":[10],
 	  "test_num_processes":[2],
-	  "screenshot_interval":[200],
+	  "screenshot_interval":[0],
 	  "log_plr_buffer_stats": [true],
 	  "log_replay_complexity": [true],
 	  "checkpoint":[true],

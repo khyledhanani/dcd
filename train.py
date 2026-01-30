@@ -9,36 +9,65 @@ import os
 import time
 import timeit
 import logging
+
+print("DEBUG 1: Basic imports done", flush=True)
+
 from arguments import parser
 
+print("DEBUG 2: Parser imported", flush=True)
+
 import torch
+print("DEBUG 3: Torch imported", flush=True)
+
 import gym
+print("DEBUG 4: Gym imported", flush=True)
+
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+print("DEBUG 5: Matplotlib imported", flush=True)
+
 from baselines.logger import HumanOutputFormat
+print("DEBUG 6: Baselines imported", flush=True)
 
 display = None
 
-if sys.platform.startswith('linux'):
-    print('Setting up virtual display')
+# Virtual display disabled - requires xvfb
+# if sys.platform.startswith('linux'):
+#     print('Setting up virtual display')
+#
+#     import pyvirtualdisplay
+#     display = pyvirtualdisplay.Display(visible=0, size=(1400, 900), color_depth=24)
+#     display.start()
 
-    import pyvirtualdisplay
-    display = pyvirtualdisplay.Display(visible=0, size=(1400, 900), color_depth=24)
-    display.start()
-
+print("DEBUG 7: About to import multigrid", flush=True)
 from envs.multigrid import *
+print("DEBUG 8: Multigrid imported", flush=True)
+
 from envs.multigrid.adversarial import *
+print("DEBUG 9: Multigrid adversarial imported", flush=True)
+
 from envs.box2d import *
+print("DEBUG 10: Box2d imported", flush=True)
+
 from envs.bipedalwalker import *
-from envs.runners.adversarial_runner import AdversarialRunner 
+print("DEBUG 11: Bipedalwalker imported", flush=True)
+
+from envs.runners.adversarial_runner import AdversarialRunner
+print("DEBUG 12: AdversarialRunner imported", flush=True)
+
 from util import make_agent, FileWriter, safe_checkpoint, create_parallel_env, make_plr_args, save_images
+print("DEBUG 13: Util imported", flush=True)
+
 from eval import Evaluator
+print("DEBUG 14: Evaluator imported", flush=True)
 
 
 if __name__ == '__main__':
+    print("DEBUG 15: Entered main", flush=True)
     os.environ["OMP_NUM_THREADS"] = "1"
 
     args = parser.parse_args()
+    print("DEBUG 16: Args parsed", flush=True)
     
     # === Configure logging ==
     if args.xpid is None:
@@ -69,12 +98,16 @@ if __name__ == '__main__':
         print('Using CUDA\n')
 
     # === Create parallel envs ===
+    print("DEBUG 17: About to create parallel envs", flush=True)
     venv, ued_venv = create_parallel_env(args)
+    print("DEBUG 18: Parallel envs created", flush=True)
 
     is_training_env = args.ued_algo in ['paired', 'flexible_paired', 'minimax']
     is_paired = args.ued_algo in ['paired', 'flexible_paired']
 
+    print("DEBUG 19: About to create agent", flush=True)
     agent = make_agent(name='agent', env=venv, args=args, device=device)
+    print("DEBUG 20: Agent created", flush=True)
     adversary_agent, adversary_env = None, None
     if is_paired or args.use_accel_paired:
         adversary_agent = make_agent(name='adversary_agent', env=venv, args=args, device=device)
@@ -89,6 +122,7 @@ if __name__ == '__main__':
     plr_args = None
     if args.use_plr:
         plr_args = make_plr_args(args, venv.observation_space, venv.action_space)
+    print("DEBUG 21: About to create runner", flush=True)
     train_runner = AdversarialRunner(
         args=args,
         venv=venv,
