@@ -85,21 +85,25 @@ class AdversarialRunner(object):
 
         self.device = device
 
+        print("DEBUG RUNNER: About to call train/eval", flush=True)
         if train:
             self.train()
         else:
             self.eval()
 
+        print("DEBUG RUNNER: About to call reset", flush=True)
         self.reset()        
         self.use_accel_paired = args.use_accel_paired
 
         # Set up PLR
+        print("DEBUG RUNNER: Setting up PLR", flush=True)
         self.level_store = None
         self.level_samplers = {}
         self.current_level_seeds = None
         self.weighted_num_edits = 0
         self.latest_env_stats = defaultdict(float)
         if plr_args:
+            print("DEBUG RUNNER: plr_args provided, setting up level samplers", flush=True)
             if self.is_paired:
                 if not args.protagonist_plr and not args.antagonist_plr:
                     self.level_samplers.update({
@@ -113,8 +117,11 @@ class AdversarialRunner(object):
             else:
                 self.level_samplers['agent'] = LevelSampler(**plr_args)
 
+            print(f"DEBUG RUNNER: use_byte_encoding = {self.use_byte_encoding}", flush=True)
             if self.use_byte_encoding:
+                print("DEBUG RUNNER: About to call ued_venv.get_encodings()", flush=True)
                 example = self.ued_venv.get_encodings()[0]
+                print("DEBUG RUNNER: Got encodings", flush=True)
                 data_info = {
                     'numpy': True,
                     'dtype': example.dtype,
@@ -136,9 +143,11 @@ class AdversarialRunner(object):
             self.edit_prob = 0
             self.base_levels = None
 
+        print("DEBUG RUNNER: PLR setup complete", flush=True)
         # Set up ALP-GMM
         if self.is_alp_gmm:
             self._init_alp_gmm()
+        print("DEBUG RUNNER: __init__ complete", flush=True)
 
     @property
     def use_byte_encoding(self):

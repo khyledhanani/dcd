@@ -61,6 +61,7 @@ print("DEBUG 13: Util imported", flush=True)
 from eval import Evaluator
 print("DEBUG 14: Evaluator imported", flush=True)
 
+print(f"DEBUG 14.5: __name__ = {__name__}", flush=True)
 
 if __name__ == '__main__':
     print("DEBUG 15: Entered main", flush=True)
