@@ -195,6 +195,15 @@ if __name__ == '__main__':
     update_start_time = timer()
     num_updates = int(args.num_env_steps) // args.num_steps // args.num_processes
     
+    print(f"\n=== TRAINING CONFIGURATION ===", flush=True)
+    print(f"num_env_steps: {args.num_env_steps}", flush=True)
+    print(f"num_steps: {args.num_steps}", flush=True)
+    print(f"num_processes: {args.num_processes}", flush=True)
+    print(f"Calculated num_updates: {num_updates}", flush=True)
+    print(f"initial_update_count: {initial_update_count}", flush=True)
+    print(f"Will train from {initial_update_count} to {num_updates} ({num_updates - initial_update_count} iterations)", flush=True)
+    print(f"==============================\n", flush=True)
+    
     pbar = tqdm(range(initial_update_count, num_updates), 
                 desc="Training", 
                 initial=initial_update_count, 
