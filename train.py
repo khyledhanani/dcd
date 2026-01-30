@@ -9,6 +9,7 @@ import os
 import time
 import timeit
 import logging
+from tqdm import tqdm
 
 print("DEBUG 1: Basic imports done", flush=True)
 
@@ -193,7 +194,14 @@ if __name__ == '__main__':
     last_checkpoint_idx = getattr(train_runner, args.checkpoint_basis)
     update_start_time = timer()
     num_updates = int(args.num_env_steps) // args.num_steps // args.num_processes
-    for j in range(initial_update_count, num_updates):
+    
+    pbar = tqdm(range(initial_update_count, num_updates), 
+                desc="Training", 
+                initial=initial_update_count, 
+                total=num_updates,
+                dynamic_ncols=True)
+    
+    for j in pbar:
         stats = train_runner.run()
 
         # === Perform logging ===
@@ -228,6 +236,14 @@ if __name__ == '__main__':
             stats.update({'sps': sps})
             stats.update(test_stats) # Ensures sps column is always before test stats
             log_stats(stats)
+            
+            # Update progress bar with key stats
+            pbar_stats = {}
+            if 'return' in stats and stats['return'] is not None:
+                pbar_stats['return'] = f"{stats['return']:.2f}"
+            if 'sps' in stats:
+                pbar_stats['sps'] = f"{stats['sps']:.1f}"
+            pbar.set_postfix(pbar_stats)
 
         checkpoint_idx = getattr(train_runner, args.checkpoint_basis)
 
@@ -273,6 +289,7 @@ if __name__ == '__main__':
                         normalize=True, channels_first=False)
                 plt.close()
 
+    pbar.close()
     evaluator.close()
     venv.close()
 
