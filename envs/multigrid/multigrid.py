@@ -1014,29 +1014,123 @@ class MultiGridEnv(minigrid.MiniGridEnv):
 
     return grid, vis_mask
 
+  def _encode_grid_vectorized(self, grid, vis_mask):
+    """Vectorized grid encoding - encodes entire grid at once using numpy ops.
+
+    Args:
+      grid: Grid object to encode
+      vis_mask: Visibility mask array
+
+    Returns:
+      Encoded numpy array of shape (width, height, 3)
+    """
+    w, h = grid.width, grid.height
+    array = np.zeros((w, h, 3), dtype='uint8')
+
+    # Pre-compute unseen encoding
+    unseen_idx = minigrid.OBJECT_TO_IDX['unseen']
+    empty_idx = minigrid.OBJECT_TO_IDX['empty']
+
+    # Vectorized: set all unseen cells at once
+    unseen_mask = ~vis_mask
+    array[unseen_mask, 0] = unseen_idx
+
+    # For visible cells, encode objects
+    visible_indices = np.argwhere(vis_mask)
+    for idx in visible_indices:
+      i, j = idx[0], idx[1]
+      v = grid.get(i, j)
+      if v is None:
+        array[i, j, 0] = empty_idx
+      else:
+        array[i, j, :] = v.encode()
+
+    return array
+
+  def _rotate_array_vectorized(self, array, num_rotations):
+    """Rotate encoded array using numpy rot90 instead of iterative rotation.
+
+    Args:
+      array: numpy array of shape (w, h, 3)
+      num_rotations: number of counter-clockwise 90-degree rotations (0-3)
+
+    Returns:
+      Rotated array
+    """
+    if num_rotations == 0:
+      return array
+    # np.rot90 rotates counter-clockwise, axes=(0,1) for 2D rotation
+    return np.rot90(array, k=num_rotations, axes=(0, 1))
+
   def gen_obs(self):
     """Generate the stacked observation for all agents."""
-    images = []
-    dirs = []
-    for a in range(self.n_agents):
-      image, direction = self.gen_agent_obs(a)
-      images.append(image)
-      dirs.append(direction)
+    # Use vectorized generation for better performance
+    return self._gen_obs_vectorized()
 
-    # Backwards compatibility: if there is a single agent do not return an array
+  def _gen_obs_vectorized(self):
+    """Vectorized observation generation for all agents.
+
+    Pre-allocates arrays and minimizes Python loop overhead.
+    """
     if self.minigrid_mode:
-      images = images[0]
+      # Single agent mode - use original path for backwards compatibility
+      image, direction = self.gen_agent_obs(0)
+      return {'image': image, 'direction': [direction]}
 
-    # Observations are dictionaries containing:
-    # - an image (partially observable view of the environment)
-    # - the agent's direction/orientation (acting as a compass)
-    # Note direction has shape (1,) for tfagents compatibility
-    obs = {
+    # Pre-allocate output arrays for all agents
+    images = np.zeros(
+        (self.n_agents, self.agent_view_size, self.agent_view_size, 3),
+        dtype='uint8'
+    )
+    dirs = np.zeros(self.n_agents, dtype='int64')
+
+    # Cache for visibility masks with same agent position (relative to view)
+    # Key: (top_x, top_y, direction), Value: vis_mask
+    vis_cache = {} if not self.see_through_walls else None
+
+    # Pre-compute all agent view extents at once
+    view_extents = [self.get_view_exts(a) for a in range(self.n_agents)]
+
+    for a in range(self.n_agents):
+      top_x, top_y, _, _ = view_extents[a]
+      direction = self.agent_dir[a]
+      dirs[a] = direction
+
+      # Slice the grid
+      grid = self.grid.slice(top_x, top_y, self.agent_view_size,
+                             self.agent_view_size)
+
+      # Rotate grid based on agent direction
+      for _ in range(direction + 1):
+        grid = grid.rotate_left()
+
+      # Get or compute visibility mask
+      if self.see_through_walls:
+        vis_mask = np.ones((grid.width, grid.height), dtype=np.bool_)
+      else:
+        # Cache key based on relative position and grid content hash
+        cache_key = (top_x, top_y, direction)
+        if cache_key in vis_cache:
+          vis_mask = vis_cache[cache_key]
+        else:
+          vis_mask = grid.process_vis(
+              agent_pos=(self.agent_view_size // 2, self.agent_view_size - 1))
+          vis_cache[cache_key] = vis_mask
+
+      # Handle carried object
+      agent_pos = grid.width // 2, grid.height - 1
+      if self.carrying[a]:
+        grid.set(agent_pos[0], agent_pos[1], self.carrying[a])
+      else:
+        grid.set(agent_pos[0], agent_pos[1], None)
+
+      # Encode directly into pre-allocated array
+      images[a] = grid.encode(vis_mask)
+
+    return {
         'image': images,
-        'direction': dirs
+        'direction': dirs.tolist()
     }
-
-    return obs
 
   def gen_agent_obs(self, agent_id):
     """Generate the agent's view (partially observed, low-resolution encoding).

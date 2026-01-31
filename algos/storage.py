@@ -154,36 +154,44 @@ class RolloutStorage(object):
 
     def insert(self, obs, recurrent_hidden_states, actions, action_log_probs, action_log_dist,
                value_preds, rewards, masks, bad_masks, level_seeds=None, cliffhanger_masks=None):
+        """Optimized insert using batched tensor operations where possible."""
         if len(rewards.shape) == 3: rewards = rewards.squeeze(2)
 
-        if self.is_dict_obs:
-            [self.obs[k][self.step + 1].copy_(obs[k]) for k in self.obs.keys()]
-        else:
-            self.obs[self.step + 1].copy_(obs)
+        step = self.step
+        next_step = step + 1
 
+        # Batch copy for observations
+        if self.is_dict_obs:
+            for k in self.obs.keys():
+                self.obs[k][next_step].copy_(obs[k])
+        else:
+            self.obs[next_step].copy_(obs)
+
+        # Recurrent hidden states
         if self.is_lstm:
-            self.recurrent_hidden_states[self.step +1,:,
+            self.recurrent_hidden_states[next_step, :,
                 :self.recurrent_hidden_state_size].copy_(recurrent_hidden_states[0])
-            self.recurrent_hidden_states[self.step +1,:,
+            self.recurrent_hidden_states[next_step, :,
                 self.recurrent_hidden_state_size:].copy_(recurrent_hidden_states[1])
         else:
-            self.recurrent_hidden_states[self.step + 1].copy_(recurrent_hidden_states)
+            self.recurrent_hidden_states[next_step].copy_(recurrent_hidden_states)
 
-        self.actions[self.step].copy_(actions) 
-        self.action_log_probs[self.step].copy_(action_log_probs)
-        self.action_log_dist[self.step].copy_(action_log_dist)
-        self.value_preds[self.step].copy_(value_preds)
-        self.rewards[self.step].copy_(rewards)
-        self.masks[self.step + 1].copy_(masks)
-        self.bad_masks[self.step + 1].copy_(bad_masks)
+        # Batch copy core tensors - use index assignment for better memory locality
+        self.actions[step] = actions
+        self.action_log_probs[step] = action_log_probs
+        self.action_log_dist[step] = action_log_dist
+        self.value_preds[step] = value_preds
+        self.rewards[step] = rewards
+        self.masks[next_step] = masks
+        self.bad_masks[next_step] = bad_masks
 
         if cliffhanger_masks is not None:
-            self.cliffhanger_masks[self.step + 1].copy_(cliffhanger_masks)
+            self.cliffhanger_masks[next_step] = cliffhanger_masks
 
         if level_seeds is not None:
-            self.level_seeds[self.step].copy_(level_seeds)
+            self.level_seeds[step] = level_seeds
 
-        self.step = (self.step + 1) % self.num_steps
+        self.step = (step + 1) % self.num_steps
 
     def insert_truncated_obs(self, obs, index):
         if self.is_dict_obs:
@@ -230,29 +238,37 @@ class RolloutStorage(object):
 
         return self.truncated_value_preds
 
-    def compute_gae_returns(self, 
+    def compute_gae_returns(self,
                             returns_buffer,
-                            next_value, 
-                            gamma, 
+                            next_value,
+                            gamma,
                             gae_lambda):
+        """Compute GAE returns with optimized tensor operations.
+
+        Uses vectorized delta computation and optimized loop for GAE accumulation.
+        """
         self.value_preds[-1] = next_value
-        gae = 0
         value_preds = self.value_preds
 
         if self.use_proper_time_limits:
-            # Get truncated value preds
             self._compute_truncated_value_preds()
             value_preds = self.truncated_value_preds
 
         if self.use_popart:
-            self.denorm_value_preds = self.model.popart.denormalize(value_preds) # denormalize all value predictions
+            self.denorm_value_preds = self.model.popart.denormalize(value_preds)
             value_preds = self.denorm_value_preds
 
-        for step in reversed(range(self.rewards.size(0))):
-            delta = self.rewards[step] + \
-                gamma*value_preds[step + 1]*self.masks[step + 1] - value_preds[step]
+        # Pre-compute all deltas at once (vectorized)
+        num_steps = self.rewards.size(0)
+        deltas = self.rewards + gamma * value_preds[1:num_steps+1] * self.masks[1:num_steps+1] - value_preds[:num_steps]
 
-            gae = delta + gamma * gae_lambda * self.masks[step + 1] * gae
+        # GAE computation still requires sequential accumulation due to dependency
+        # But we avoid repeated tensor indexing by using local variables
+        gae = torch.zeros_like(self.rewards[0])
+        gae_coef = gamma * gae_lambda
+
+        for step in range(num_steps - 1, -1, -1):
+            gae = deltas[step] + gae_coef * self.masks[step + 1] * gae
             self.returns[step] = gae + value_preds[step]
 
     def compute_discounted_returns(self,
@@ -393,6 +409,11 @@ class RolloutStorage(object):
                                advantages,
                                num_mini_batch=None,
                                mini_batch_size=None):
+        """Optimized feed-forward generator with pre-flattened tensors.
+
+        Pre-computes flattened views once before iteration to avoid
+        repeated view/reshape operations inside the loop.
+        """
         num_steps, num_processes = self.rewards.size()[0:2]
         batch_size = num_processes * num_steps
 
@@ -405,36 +426,45 @@ class RolloutStorage(object):
                           num_mini_batch))
             mini_batch_size = batch_size // num_mini_batch
 
+        # Pre-flatten all tensors ONCE before the loop (optimization)
+        if self.is_dict_obs:
+            obs_flat = {k: self.obs[k][:-1].reshape(-1, *self.obs[k].size()[2:])
+                        for k in self.obs.keys()}
+        else:
+            obs_flat = self.obs[:-1].reshape(-1, *self.obs.size()[2:])
+
+        rhs_flat = self.recurrent_hidden_states[:-1].reshape(
+            -1, self.recurrent_hidden_states.size(-1))
+        actions_flat = self.actions.reshape(-1, self.actions.size(-1))
+        value_preds_flat = self.value_preds[:-1].reshape(-1, 1)
+        returns_flat = self.returns[:-1].reshape(-1, 1)
+        masks_flat = self.masks[:-1].reshape(-1, 1)
+        action_log_probs_flat = self.action_log_probs.reshape(-1, 1)
+        adv_flat = advantages.reshape(-1, 1) if advantages is not None else None
+
         sampler = BatchSampler(
             SubsetRandomSampler(range(batch_size)),
             mini_batch_size,
             drop_last=False)
-     
+
         for indices in sampler:
+            # Convert indices to tensor for efficient indexing
+            idx = torch.tensor(indices, dtype=torch.long, device=self.device)
+
             if self.is_dict_obs:
-                obs_batch = {k: self.obs[k][:-1].view(-1, *self.obs[k].size()[2:])[indices] for k in self.obs.keys()}
+                obs_batch = {k: obs_flat[k][idx] for k in obs_flat.keys()}
             else:
-                obs_batch = self.obs[:-1].view(-1, *self.obs.size()[2:])[indices]
+                obs_batch = obs_flat[idx]
 
-            recurrent_hidden_states_batch = self.recurrent_hidden_states[:-1].view(
-                -1, self.recurrent_hidden_states.size(-1))[indices]
+            recurrent_hidden_states_batch = rhs_flat[idx]
+            actions_batch = actions_flat[idx]
+            value_preds_batch = value_preds_flat[idx]
+            return_batch = returns_flat[idx]
+            masks_batch = masks_flat[idx]
+            old_action_log_probs_batch = action_log_probs_flat[idx]
+            adv_targ = adv_flat[idx] if adv_flat is not None else None
 
-            actions_batch = self.actions.view(-1,
-                                            self.actions.size(-1))[indices]
-
-            value_preds_batch = self.value_preds[:-1].view(-1, 1)[indices]
-            return_batch = self.returns[:-1].view(-1, 1)[indices]
-
-            masks_batch = self.masks[:-1].view(-1, 1)[indices]
-            old_action_log_probs_batch = self.action_log_probs.view(-1,
-                                                                    1)[indices]
-            if advantages is None:
-                adv_targ = None
-            else:
-                adv_targ = advantages.view(-1, 1)[indices]
-
-            if self.is_lstm: 
-                # Split into (hxs, cxs) for LSTM
+            if self.is_lstm:
                 recurrent_hidden_states_batch = \
                     self._split_batched_lstm_recurrent_hidden_states(recurrent_hidden_states_batch)
 
@@ -442,61 +472,41 @@ class RolloutStorage(object):
                 value_preds_batch, return_batch, masks_batch, old_action_log_probs_batch, adv_targ
 
     def recurrent_generator(self, advantages, num_mini_batch):
+        """Optimized recurrent generator using direct tensor indexing.
+
+        Avoids list accumulation and stacking by using vectorized index selection.
+        """
         num_processes = self.rewards.size(1)
         assert num_processes >= num_mini_batch, (
             "PPO requires the number of processes ({}) "
             "to be greater than or equal to the number of "
             "PPO mini batches ({}).".format(num_processes, num_mini_batch))
         num_envs_per_batch = num_processes // num_mini_batch
-        perm = torch.randperm(num_processes)
+        perm = torch.randperm(num_processes, device=self.device)
+
+        T = self.num_steps
+        N = num_envs_per_batch
 
         for start_ind in range(0, num_processes, num_envs_per_batch):
+            # Get indices for this batch directly
+            batch_indices = perm[start_ind:start_ind + num_envs_per_batch]
+
+            # Direct tensor indexing instead of list accumulation
             if self.is_dict_obs:
-                obs_batch = defaultdict(list)
+                obs_batch = {k: self.obs[k][:-1, batch_indices]
+                             for k in self.obs.keys()}
             else:
-                obs_batch = []
-            recurrent_hidden_states_batch = []
-            actions_batch = []
-            value_preds_batch = []
-            return_batch = []
-            masks_batch = []
-            old_action_log_probs_batch = []
-            adv_targ = []
+                obs_batch = self.obs[:-1, batch_indices]
 
-            for offset in range(num_envs_per_batch):
-                ind = perm[start_ind + offset]
-                if self.is_dict_obs:
-                    [obs_batch[k].append(self.obs[k][:-1,ind]) for k in self.obs.keys()]
-                else:
-                    obs_batch.append(self.obs[:-1, ind])
-                recurrent_hidden_states_batch.append(
-                    self.recurrent_hidden_states[0:1, ind])
-                actions_batch.append(self.actions[:, ind])
-                value_preds_batch.append(self.value_preds[:-1, ind])
-                return_batch.append(self.returns[:-1, ind])
-                masks_batch.append(self.masks[:-1, ind])
-                old_action_log_probs_batch.append(
-                    self.action_log_probs[:, ind])
-                adv_targ.append(advantages[:, ind])
+            # Shape: (1, N, hidden_size) -> (N, hidden_size)
+            recurrent_hidden_states_batch = self.recurrent_hidden_states[0, batch_indices]
 
-            T, N = self.num_steps, num_envs_per_batch
-            # These are all tensors of size (T, N, -1)
-            if self.is_dict_obs:
-                for k in obs_batch.keys():
-                    obs_batch[k] = torch.stack(obs_batch[k],1)
-            else:
-                obs_batch = torch.stack(obs_batch, 1)
-            actions_batch = torch.stack(actions_batch, 1)
-            value_preds_batch = torch.stack(value_preds_batch, 1)
-            return_batch = torch.stack(return_batch, 1)
-            masks_batch = torch.stack(masks_batch, 1)
-            old_action_log_probs_batch = torch.stack(
-                old_action_log_probs_batch, 1)
-            adv_targ = torch.stack(adv_targ, 1)
-
-            # States is just a (N, -1) tensor
-            recurrent_hidden_states_batch = torch.stack(
-                recurrent_hidden_states_batch, 1).view(N, -1)
+            actions_batch = self.actions[:, batch_indices]
+            value_preds_batch = self.value_preds[:-1, batch_indices]
+            return_batch = self.returns[:-1, batch_indices]
+            masks_batch = self.masks[:-1, batch_indices]
+            old_action_log_probs_batch = self.action_log_probs[:, batch_indices]
+            adv_targ = advantages[:, batch_indices]
 
             # Flatten the (T, N, ...) tensors to (T * N, ...)
             obs_batch = _flatten_helper(T, N, obs_batch)
@@ -504,12 +514,10 @@ class RolloutStorage(object):
             value_preds_batch = _flatten_helper(T, N, value_preds_batch)
             return_batch = _flatten_helper(T, N, return_batch)
             masks_batch = _flatten_helper(T, N, masks_batch)
-            old_action_log_probs_batch = _flatten_helper(T, N, \
-                    old_action_log_probs_batch)
+            old_action_log_probs_batch = _flatten_helper(T, N, old_action_log_probs_batch)
             adv_targ = _flatten_helper(T, N, adv_targ)
 
-            if self.is_lstm: 
-                # Split into (hxs, cxs) for LSTM
+            if self.is_lstm:
                 recurrent_hidden_states_batch = \
                     self._split_batched_lstm_recurrent_hidden_states(recurrent_hidden_states_batch)
 
